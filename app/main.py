@@ -23,16 +23,107 @@ from sqlite3 import Connection
 from . import db
 from .schemas import (
     BoundsOut,
+    ChainBasis,
+    ChainStepOut,
+    ContradictionChainOut,
     CountReportIn,
     CountReportOut,
     InspectionCreate,
     InspectionDetail,
     InspectionSummary,
     InspectionUpdate,
+    RecheckRow,
+    RejectionDetail,
 )
-from .solver import InconsistentCounts, check_consistent, compute_bounds
+from .solver import (
+    EVIDENCE_MONOTONE,
+    EVIDENCE_SEGMENT,
+    EVIDENCE_TOTAL,
+    InconsistentCounts,
+    LabeledConstraint,
+    check_consistent,
+    compute_bounds,
+)
 
 DEFAULT_DB_PATH = os.environ.get("DB_PATH", "./data/inspection.db")
+
+
+def _build_rejection_detail(exc: InconsistentCounts, message: str) -> dict:
+    """把求解器给出的矛盾链转成 409 回执（含回查行清单）。"""
+    assert exc.chain is not None
+    chain = exc.chain
+
+    # 回查行：矛盾链实际引用到的全部区间计数，按出处去重。
+    seen: set[tuple[bool, int | None, int]] = set()
+    recheck_rows: list[RecheckRow] = []
+    steps_out: list[ChainStepOut] = []
+    for step in chain.steps:
+        evidence = step.evidence
+        basis_kwargs = {"kind": evidence.kind}
+        if evidence.kind == EVIDENCE_SEGMENT:
+            key = (evidence.current, evidence.report_id, int(evidence.row_number))
+            basis_kwargs.update(
+                {
+                    "source": "本次补报" if evidence.current else "已接收报告",
+                    "report_id": evidence.report_id,
+                    "row_number": evidence.row_number,
+                    "lo": evidence.lo,
+                    "hi": evidence.hi,
+                    "count": evidence.count,
+                }
+            )
+            if key not in seen:
+                seen.add(key)
+                recheck_rows.append(
+                    RecheckRow(
+                        source="本次补报" if evidence.current else "已接收报告",
+                        report_id=evidence.report_id,
+                        row_number=int(evidence.row_number),  # type: ignore[arg-type]
+                        lo=int(evidence.lo),  # type: ignore[arg-type]
+                        hi=int(evidence.hi),  # type: ignore[arg-type]
+                        count=int(evidence.count),  # type: ignore[arg-type]
+                    )
+                )
+        elif evidence.kind == EVIDENCE_TOTAL:
+            basis_kwargs.update(
+                {
+                    "total_pieces": evidence.total_pieces,
+                    "rule": f"登记总片数（{evidence.total_pieces}）："
+                    "F(+∞) - F(0) = 总片数",
+                }
+            )
+        else:  # EVIDENCE_MONOTONE
+            basis_kwargs.update(
+                {"rule": "累计片数单调规则：厚度越大，累计片数不减"}
+            )
+        steps_out.append(
+            ChainStepOut(
+                start=step.start,
+                end=step.end,
+                upper_bound=step.upper_bound,
+                basis=ChainBasis(**basis_kwargs),
+            )
+        )
+
+    # 回查行先列本次补报（按行号），再列旧报告（按报告号、行号），方便复核。
+    recheck_rows.sort(
+        key=lambda row: (
+            row.source != "本次补报",
+            row.report_id if row.report_id is not None else 0,
+            row.row_number,
+        )
+    )
+
+    detail = RejectionDetail(
+        message=message,
+        recheck_rows=recheck_rows,
+        contradiction_chain=ContradictionChainOut(
+            steps=steps_out,
+            bound_sum=chain.bound_sum,
+            closed_loop=True,
+        ),
+    )
+    return detail.model_dump()
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -130,8 +221,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         tags=["登记"],
         summary="更正总片数或备注",
         description=(
-            "若新的总片数与已接收的计数不相容，整次更正被拒收，原登记保持不变。"
+            "若新的总片数与已接收的计数不相容，整次更正被拒收，原登记保持不变；"
+            "409 回执同样附带回查行与可验算矛盾链。"
         ),
+        responses={409: {"model": RejectionDetail, "description": "新总片数冲突，更正拒收"}},
     )
     def update_inspection(
         inspection_id: int,
@@ -148,17 +241,27 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             new_note = payload.note if "note" in payload.model_fields_set else row["note"]
             if "total_pieces" in payload.model_fields_set:
-                constraints = db.load_constraints(connection, inspection_id)
+                constraints = [
+                    LabeledConstraint(
+                        lo=item["lo"],
+                        hi=item["hi"],
+                        count=item["count"],
+                        report_id=item["report_id"],
+                        row_number=item["row_number"],
+                    )
+                    for item in db.load_labeled_constraints(connection, inspection_id)
+                ]
                 try:
                     check_consistent(new_total, constraints)
-                except InconsistentCounts:
+                except InconsistentCounts as exc:
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
-                        detail=(
+                        detail=_build_rejection_detail(
+                            exc,
                             f"新总片数 {new_total} 与已接收的计数不相容，"
-                            "本次更正已拒收，原登记保持不变"
+                            "本次更正已拒收，原登记保持不变",
                         ),
-                    )
+                    ) from exc
             db.update_inspection(connection, inspection_id, new_total, new_note)
             connection.execute("COMMIT")
         except HTTPException:
@@ -179,30 +282,57 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description=(
             "区间可以重叠。整份报告要么全部接收，要么在与已有计数"
             "（含本报告内其他区间）不相容时整份拒收；拒收不改变已有结果。"
+            "拒收（409）回执给出需要回查的行清单，以及一条首尾相接、"
+            "各步上限之和严格小于零的可验算矛盾链。"
         ),
+        responses={409: {"model": RejectionDetail, "description": "不相容，整份拒收"}},
     )
     def submit_report(
         inspection_id: int,
         payload: CountReportIn,
         connection: Connection = Depends(get_conn),
     ) -> CountReportOut:
-        segments = [(s.lo, s.hi, s.count) for s in payload.segments]
+        # 本次补报的行号即表内序号（从 1 起）；report_id 置 None 标记为“本次”。
+        incoming = [
+            LabeledConstraint(
+                lo=segment.lo,
+                hi=segment.hi,
+                count=segment.count,
+                report_id=None,
+                row_number=position,
+            )
+            for position, segment in enumerate(payload.segments, start=1)
+        ]
 
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = _require_inspection(connection, inspection_id)
-            existing = db.load_constraints(connection, inspection_id)
+            existing = [
+                LabeledConstraint(
+                    lo=item["lo"],
+                    hi=item["hi"],
+                    count=item["count"],
+                    report_id=item["report_id"],
+                    row_number=item["row_number"],
+                )
+                for item in db.load_labeled_constraints(connection, inspection_id)
+            ]
             try:
-                check_consistent(int(row["total_pieces"]), existing + segments)
+                check_consistent(int(row["total_pieces"]), existing + incoming)
             except InconsistentCounts as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=(
+                    detail=_build_rejection_detail(
+                        exc,
                         "补报与已有计数（或本报告内部）不相容，整份拒收；"
-                        "已有结果保持不变"
+                        "已有结果保持不变",
                     ),
                 ) from exc
-            report_id = db.insert_report(connection, inspection_id, segments)
+            report_id = db.insert_report(
+                connection,
+                inspection_id,
+                [(item.lo, item.hi, item.count) for item in incoming],
+            )
             connection.execute("COMMIT")
         except HTTPException:
             connection.execute("ROLLBACK")
@@ -255,7 +385,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 detail="qualified_hi 必须大于 qualified_lo（区间含起点、不含终点）",
             )
         row = _require_inspection(connection, inspection_id)
-        constraints = db.load_constraints(connection, inspection_id)
+        constraints = [
+            LabeledConstraint(
+                lo=item["lo"],
+                hi=item["hi"],
+                count=item["count"],
+                report_id=item["report_id"],
+                row_number=item["row_number"],
+            )
+            for item in db.load_labeled_constraints(connection, inspection_id)
+        ]
         try:
             min_count, max_count = compute_bounds(
                 int(row["total_pieces"]), constraints, qualified_lo, qualified_hi

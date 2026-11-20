@@ -78,3 +78,57 @@ class BoundsOut(BaseModel):
     qualified_hi: int
     min_count: int = Field(..., description="同时满足全部计数时，合格片数可达到的最小值")
     max_count: int = Field(..., description="同时满足全部计数时，合格片数可达到的最大值")
+
+
+class RecheckRow(BaseModel):
+    """矛盾链要求回查的一行计数。"""
+
+    source: str = Field(..., description="本次补报 或 已接收报告")
+    report_id: int | None = Field(
+        None, description="已接收报告编号；本次补报的行该字段为 null"
+    )
+    row_number: int = Field(..., description="区间在其所属报告内的行号，从 1 起")
+    lo: int
+    hi: int
+    count: int
+
+
+class ChainBasis(BaseModel):
+    """矛盾链单步上限的依据。"""
+
+    kind: str = Field(
+        ..., description="segment=区间计数；total=登记总片数；monotone=累计片数单调规则"
+    )
+    source: str | None = Field(None, description="本次补报 或 已接收报告（segment 时）")
+    report_id: int | None = Field(None, description="报告编号；本次补报为 null")
+    row_number: int | None = Field(None, description="报告内区间行号，从 1 起")
+    lo: int | None = None
+    hi: int | None = None
+    count: int | None = None
+    total_pieces: int | None = Field(None, description="登记总片数数值（total 时）")
+    rule: str | None = Field(None, description="规则文字说明（monotone 时）")
+
+
+class ChainStepOut(BaseModel):
+    """矛盾链一步：F(end) - F(start) <= upper_bound。"""
+
+    start: int | str = Field(..., description="起点端点厚度；'+∞' 表示全部片数端点")
+    end: int | str = Field(..., description="终点端点厚度；'+∞' 表示全部片数端点")
+    upper_bound: int = Field(..., description="终点累计片数减起点累计片数的上限")
+    basis: ChainBasis
+
+
+class ContradictionChainOut(BaseModel):
+    steps: list[ChainStepOut]
+    bound_sum: int = Field(
+        ..., description="各步上限之和；首尾相接且该值严格小于零即 0 <= 负数 的矛盾"
+    )
+    closed_loop: bool = Field(..., description="是否首尾相接成环")
+
+
+class RejectionDetail(BaseModel):
+    """409 整份拒收回执：回查行清单 + 可验算矛盾链。"""
+
+    message: str
+    recheck_rows: list[RecheckRow]
+    contradiction_chain: ContradictionChainOut

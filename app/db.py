@@ -121,14 +121,35 @@ def update_inspection(
     )
 
 
-def load_constraints(
+def load_labeled_constraints(
     connection: sqlite3.Connection, inspection_id: int
-) -> list[tuple[int, int, int]]:
+) -> list[dict]:
+    """加载已接收区间并附出处：报告编号 + 该报告内的区间行号（从 1 起）。
+
+    拒收判定必须使用这条带出处的数据，矛盾链才能逐行回查。
+    """
     rows = connection.execute(
-        "SELECT lo, hi, count FROM segments WHERE inspection_id = ? ORDER BY id",
+        """
+        SELECT report_id, lo, hi, count,
+               ROW_NUMBER() OVER (
+                   PARTITION BY report_id ORDER BY id
+               ) AS row_number
+        FROM segments
+        WHERE inspection_id = ?
+        ORDER BY id
+        """,
         (inspection_id,),
     ).fetchall()
-    return [(int(row["lo"]), int(row["hi"]), int(row["count"])) for row in rows]
+    return [
+        {
+            "report_id": int(row["report_id"]),
+            "row_number": int(row["row_number"]),
+            "lo": int(row["lo"]),
+            "hi": int(row["hi"]),
+            "count": int(row["count"]),
+        }
+        for row in rows
+    ]
 
 
 def insert_report(
